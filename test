@@ -1,0 +1,37 @@
+    mtp_layer_state_dict_keys = set(mtp_layer.state_dict().keys())
+
+    # 从 index 读取权重与文件的映射（MTP 权重可能分布在多个 safetensors 中）
+    model_index_path = os.path.join(model_path, "model.safetensors.index.json")
+    model_index = json_safe_load(model_index_path)
+    weight_map = model_index['weight_map']
+
+    # 只保留 MTP 层（最后一层）的 key
+    mtp_weight_map = {k: v for k, v in weight_map.items() if k.startswith(MTP_WEIGHT_PREFIX)}
+
+    if not mtp_weight_map:
+        get_logger().warning("No MTP weights found in weight map for prefix %s", MTP_WEIGHT_PREFIX)
+        return mtp_layer
+
+    # 按文件分组，避免同一文件重复打开
+    file_to_keys = defaultdict(list)
+    for full_key in mtp_weight_map:
+        file_name = mtp_weight_map[full_key]
+        file_to_keys[file_name].append(full_key)
+
+    new_state_dict = {}
+    for file_name in file_to_keys:
+        file_path = os.path.join(model_path, file_name)
+        file_path = get_valid_read_path(
+            file_path,
+            extensions='safetensors',
+            size_max=MAX_READ_FILE_SIZE_16G,
+            is_dir=False,
+            check_user_stat=True
+        )
+        mtp_weight = load_file(file_path, device='cpu')
+        for full_key in file_to_keys[file_name]:
+            short_key = full_key.replace(MTP_WEIGHT_PREFIX, '')
+            if short_key in mtp_layer_state_dict_keys and full_key in mtp_weight:
+                new_state_dict[short_key] = mtp_weight[full_key]
+
+    mtp_layer.load_state_dict(new_state_dict, strict=False)
