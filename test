@@ -1,118 +1,68 @@
 """
-将多个 module 的输入/输出 tensor 按「module 名 + 参数名」记录，
-以 JSON 格式追加写入指定文件。
+将多个 module 的输入/输出 tensor 追加保存到指定 .pt 文件。
+每条记录包含：module 名、参数名（input/output）、tensor。
 """
-import json
 import torch
 from pathlib import Path
-from typing import Union, Optional
+from typing import Union, Literal
 
-# 默认用 .tolist() 写入 JSON；若 tensor 很大，可改为存 .pt，JSON 里只记路径
-def save_module_io(
+
+def append_module_io(
     tensor: torch.Tensor,
     module_name: str,
-    param_name: str,
+    io_kind: Literal["input", "output"],
     file_path: Union[str, Path],
-    *,
-    save_tensor_inline: bool = True,
-    tensor_dir: Optional[Union[str, Path]] = None,
 ) -> None:
     """
-    将单个 module 的某输入/输出 tensor 追加写入 JSON 文件。
+    将单个 module 的输入或输出 tensor 追加到 .pt 文件。
 
     Args:
-        tensor: 要保存的 tensor（某 module 的输入或输出）。
-        module_name: 模块名，如 "layer.0.self_attn"。
-        param_name: 参数/端口名，如 "input"、"output"、"hidden_states"。
-        file_path: JSON 文件路径，如 "module_io.json"。
-        save_tensor_inline: 为 True 时把 tensor 转成 list 写进 JSON；
-            为 False 时把 tensor 存到 tensor_dir 下的 .pt 文件，JSON 里只记路径。
-        tensor_dir: save_tensor_inline=False 时，tensor 的 .pt 文件存放目录；
-            默认用 file_path 同目录下的 "tensor_assets"。
+        tensor: 该 module 的输入或输出 tensor。
+        module_name: 模块名，如 "model.layers.0.self_attn"。
+        io_kind: "input" 或 "output"。
+        file_path: .pt 文件路径，如 "module_io.pt"。
     """
     file_path = Path(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
     record = {
         "module": module_name,
-        "param_name": param_name,
-        "shape": list(tensor.shape),
-        "dtype": str(tensor.dtype),
+        "param_name": io_kind,
+        "tensor": tensor.detach().cpu(),
     }
 
-    if save_tensor_inline:
-        record["tensor"] = tensor.detach().cpu().tolist()
-    else:
-        tdir = Path(tensor_dir) if tensor_dir else file_path.parent / "tensor_assets"
-        tdir.mkdir(parents=True, exist_ok=True)
-        # 按 module 名和 param 名生成唯一文件名，避免覆盖
-        safe_module = module_name.replace(".", "_")
-        idx = 0
-        while (tdir / f"{safe_module}_{param_name}_{idx}.pt").exists():
-            idx += 1
-        pt_path = tdir / f"{safe_module}_{param_name}_{idx}.pt"
-        torch.save(tensor.detach().cpu(), pt_path)
-        record["tensor_path"] = str(pt_path)
-
-    # 追加：先读已有内容（若是数组），再追加一条，写回
     if file_path.exists():
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = torch.load(file_path, map_location="cpu", weights_only=False)
         if not isinstance(data, list):
             data = [data]
     else:
         data = []
     data.append(record)
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    torch.save(data, file_path)
 
 
 def append_module_io_batch(
-    records: list[tuple[torch.Tensor, str, str]],
+    records: list[tuple[torch.Tensor, str, Literal["input", "output"]]],
     file_path: Union[str, Path],
-    *,
-    save_tensor_inline: bool = True,
-    tensor_dir: Optional[Union[str, Path]] = None,
 ) -> None:
     """
-    批量追加多条 module 输入/输出记录到同一 JSON 文件。
-    records: [(tensor, module_name, param_name), ...]
+    批量追加多条「module 输入/输出」到同一 .pt 文件。
+    records: [(tensor, module_name, "input"|"output"), ...]
     """
     file_path = Path(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
     if file_path.exists():
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = torch.load(file_path, map_location="cpu", weights_only=False)
         if not isinstance(data, list):
             data = [data]
     else:
         data = []
 
-    tdir = None
-    if not save_tensor_inline and tensor_dir is not None:
-        tdir = Path(tensor_dir)
-    elif not save_tensor_inline:
-        tdir = file_path.parent / "tensor_assets"
-
-    for tensor, module_name, param_name in records:
-        record = {
+    for tensor, module_name, io_kind in records:
+        data.append({
             "module": module_name,
-            "param_name": param_name,
-            "shape": list(tensor.shape),
-            "dtype": str(tensor.dtype),
-        }
-        if save_tensor_inline:
-            record["tensor"] = tensor.detach().cpu().tolist()
-        else:
-            if tdir is not None:
-                tdir.mkdir(parents=True, exist_ok=True)
-            safe_module = module_name.replace(".", "_")
-            idx = sum(1 for r in data if r.get("module") == module_name and r.get("param_name") == param_name)
-            pt_path = tdir / f"{safe_module}_{param_name}_{idx}.pt"
-            torch.save(tensor.detach().cpu(), pt_path)
-            record["tensor_path"] = str(pt_path)
-        data.append(record)
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+            "param_name": io_kind,
+            "tensor": tensor.detach().cpu(),
+        })
+    torch.save(data, file_path)
