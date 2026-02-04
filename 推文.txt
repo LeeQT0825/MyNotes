@@ -1,14 +1,111 @@
-一、量化算法
-本工具对 GLM-5 支持「预处理 + 子图融合 + 分层线性量化」的完整流水线。
-QuaRot：对权重做 Hadamard 旋转与 LayerNorm 融合，降低激活异常值、改善后续量化的数值分布。
-Flex AWQ SSZ：在 MoE 的 up-down 子图上做 W4A8 量化，权重采用 SSZ（Smooth Step Zero）标定，支持步长等超参，在低比特下兼顾精度与稳定性。
-Flex Smooth Quant：在子图内做平滑缩放，支持 OV（o_proj 与 kv_b_proj 融合）、Norm-Linear（input_layernorm / q_a_layernorm 与对应 Linear 融合）、Up-Down（gate/up_proj 与 down_proj 融合），减小子图内量化误差。
-Linear Quant：对单层 Linear 做 W8A8 或 W4A8，激活常用 per-token、对称、minmax；权重 per-channel，W4 用 SSZ，W8 用 minmax，可按模块配置不同 qconfig。
-二、适配的模型结构
-GLM-5 为 79 层 decoder-only 大模型：前若干层为 Dense FFN，后续为 MoE（路由专家 + 共享专家），最后一层带 MTP（Multi-Token Prediction）与 Indexer。适配器对该结构做了统一映射：注意力侧支持 Q/KV 双路与 indexer（wk、weights_proj、wq_b）的 Norm 融合与旋转；FFN 侧对 Dense 的 up-down 与 MoE 的 routed/shared experts 的 gate/up/down 均配置了子图类型（如 up-down），便于与 Flex AWQ SSZ、Flex Smooth Quant 对接；MTP 相关层（enorm、hnorm、eh_proj、shared_head）也纳入融合与量化流程，保证端到端一致。
-三、精度调优手段
-按模块区分比特与算法：例如 self_attn 与 mlp 主体用 W8A8，MoE 专家用 W4A8；kv_b_proj、wk、weights_proj、gate 等可按需 exclude，避免敏感层被过度压缩。
-子图级开关：通过 enable_subgraph_type 控制对 OV、norm-linear、up-down 的融合与平滑，前几层或 shared_experts 可单独 exclude，在稳定性与精度间做权衡。
-include/exclude 与分组：用 include/exclude 精确圈定参与某类量化的模块（如仅 layer 78 的 experts 用 W8、其余 experts 用 W4），再通过 group 下多段 linear_quant 组合成 W4A8 方案。
-校准与粒度：激活 per-token、对称 minmax；权重 per-channel；W4 使用 SSZ 与 step 等扩展参数，便于在 GLM-5 的 Dense + MoE + MTP 结构上做细粒度调优。
-整体上，该工具在算法、模型结构与精度调优三方面针对 GLM-5 做了专门适配，可在 W4A8/W8A8 等配置下兼顾显存与效果。
+"""
+批量替换 model.safetensors.index.json 的 weight_map 中，
+匹配 model.layers.{index}.* 的 key 为新前缀。
+"""
+import json
+import argparse
+from pathlib import Path
+
+
+def replace_layer_keys(
+    index_path: str | Path,
+    layer_index: int,
+    new_prefix: str,
+    *,
+    out_path: str | Path | None = None,
+    dry_run: bool = False,
+) -> int:
+    """
+    将 weight_map 中所有 "model.layers.{layer_index}.*" 的 key
+    替换为 "{new_prefix}.*"。
+
+    Args:
+        index_path: model.safetensors.index.json 路径。
+        layer_index: 要匹配的层号，如 78 → 匹配 "model.layers.78.*"。
+        new_prefix: 新 key 的前缀，如 "model.layers.0"。
+        out_path: 输出路径；None 则覆盖原文件。
+        dry_run: 若为 True，只打印将要替换的 key，不写文件。
+
+    Returns:
+        被替换的 key 数量。
+    """
+    index_path = Path(index_path)
+    with open(index_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    weight_map = data.get("weight_map")
+    if weight_map is None:
+        raise KeyError(f'No "weight_map" in {index_path}')
+
+    old_prefix = f"model.layers.{layer_index}."
+    if not new_prefix.endswith("."):
+        new_prefix = new_prefix.rstrip(".") + "."
+
+    new_map = {}
+    replaced_count = 0
+    for k, v in weight_map.items():
+        if k.startswith(old_prefix):
+            new_key = new_prefix + k[len(old_prefix) :]
+            new_map[new_key] = v
+            replaced_count += 1
+            if dry_run:
+                print(f"  {k!r} -> {new_key!r}")
+        else:
+            new_map[k] = v
+
+    data["weight_map"] = new_map
+
+    if not dry_run:
+        out = Path(out_path) if out_path else index_path
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"Written to {out}")
+
+    return replaced_count
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="将 index JSON 中指定 layer 的 weight_map key 批量替换为新前缀"
+    )
+    parser.add_argument(
+        "index_file",
+        type=Path,
+        help="model.safetensors.index.json 路径",
+    )
+    parser.add_argument(
+        "layer_index",
+        type=int,
+        help="要匹配的层号，如 78 表示 model.layers.78.*",
+    )
+    parser.add_argument(
+        "new_prefix",
+        type=str,
+        help="新 key 的前缀，如 model.layers.0",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=Path,
+        default=None,
+        help="输出 JSON 路径；不指定则覆盖原文件",
+    )
+    parser.add_argument(
+        "-n", "--dry-run",
+        action="store_true",
+        help="只打印替换结果，不写文件",
+    )
+    args = parser.parse_args()
+
+    n = replace_layer_keys(
+        args.index_file,
+        args.layer_index,
+        args.new_prefix,
+        out_path=args.output,
+        dry_run=args.dry_run,
+    )
+    print(f"Replaced {n} keys for model.layers.{args.layer_index}.* -> {args.new_prefix}.*")
+
+
+if __name__ == "__main__":
+    main()
