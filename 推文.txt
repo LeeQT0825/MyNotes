@@ -1,111 +1,108 @@
-"""
-批量替换 model.safetensors.index.json 的 weight_map 中，
-匹配 model.layers.{index}.* 的 key 为新前缀。
-"""
-import json
-import argparse
-from pathlib import Path
+apiversion: modelslim_v1
+metadata:
+  config_id: glm_5_w4a8
+  score: 90
+  verified_model_types:
+    - GLM-5
+  label:
+    w_bit: 4
+    a_bit: 8
+    is_sparse: False
+    kv_cache: False
 
+default_w4a8_dynamic: &default_w4a8_dynamic
+  act:
+    scope: "per_token"
+    dtype: "int8"
+    symmetric: True
+    method: "minmax"
+  weight:
+    scope: "per_channel"
+    dtype: "int4"
+    symmetric: True
+    method: "ssz"
 
-def replace_layer_keys(
-    index_path: str | Path,
-    layer_index: int,
-    new_prefix: str,
-    *,
-    out_path: str | Path | None = None,
-    dry_run: bool = False,
-) -> int:
-    """
-    将 weight_map 中所有 "model.layers.{layer_index}.*" 的 key
-    替换为 "{new_prefix}.*"。
+default_w8a8_dynamic: &default_w8a8_dynamic
+  act:
+    scope: "per_token"
+    dtype: "int8"
+    symmetric: True
+    method: "minmax"
+  weight:
+    scope: "per_channel"
+    dtype: "int8"
+    symmetric: True
+    method: "minmax"
 
-    Args:
-        index_path: model.safetensors.index.json 路径。
-        layer_index: 要匹配的层号，如 78 → 匹配 "model.layers.78.*"。
-        new_prefix: 新 key 的前缀，如 "model.layers.0"。
-        out_path: 输出路径；None 则覆盖原文件。
-        dry_run: 若为 True，只打印将要替换的 key，不写文件。
+spec:
+  process:
+    - type: "quarot"
+    - type: "flex_awq_ssz"
+      qconfig:
+        act:
+          scope: "per_token"
+          dtype: "int8"
+          symmetric: True
+          method: "minmax"
+        weight:
+          scope: "per_channel"
+          dtype: "int4"
+          symmetric: True
+          method: "ssz"
+          ext:
+            step: 10
+      enable_subgraph_type:
+        - 'up-down'
+      include:
+        - "*"
+      exclude:
+        - "model.layers.0.*"
+        - "model.layers.1.*"
+        - "model.layers.2.*"
+        - "*mlp.shared_experts.*"
+    - type: "flex_smooth_quant"
+      enable_subgraph_type:
+        - 'norm-linear'
+        - 'ov'
+        - 'up-down'
+      include:
+        - "*self_attn*"
+        - "model.layers.0.mlp.*"
+        - "model.layers.1.mlp.*"
+        - "model.layers.2.mlp.*"
+        - "*mlp.shared_experts.*"
+        - "*input_layernorm*"
+      exclude:
+        - "*post_attention_layernorm*"
+    - type: "group"
+      configs:
+        - type: "linear_quant"
+          qconfig: *default_w8a8_dynamic
+          include:
+            - "*self_attn*"
+          exclude:
+            - "*kv_b_proj"
+            - "*wk"
+            - "*weights_proj"
+        - type: "linear_quant"
+          qconfig: *default_w8a8_dynamic
+          include:
+            - "*mlp*"
+          exclude:
+            - "*gate"
+            - "*mlp.experts.*"
+        - type: "linear_quant"
+          qconfig: *default_w8a8_dynamic
+          include:
+            - "model.layers.78.mlp.experts.*"
+        - type: "linear_quant"
+          qconfig: *default_w4a8_dynamic
+          include:
+            - "*mlp.experts.*"
+          exclude:
+            - "model.layers.78.*"
+  dataset: qwen3_cot_w4a4.json
+  save:
+    - type: "ascendv1_saver"
+      part_file_size: 4
 
-    Returns:
-        被替换的 key 数量。
-    """
-    index_path = Path(index_path)
-    with open(index_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    weight_map = data.get("weight_map")
-    if weight_map is None:
-        raise KeyError(f'No "weight_map" in {index_path}')
-
-    old_prefix = f"model.layers.{layer_index}."
-    if not new_prefix.endswith("."):
-        new_prefix = new_prefix.rstrip(".") + "."
-
-    new_map = {}
-    replaced_count = 0
-    for k, v in weight_map.items():
-        if k.startswith(old_prefix):
-            new_key = new_prefix + k[len(old_prefix) :]
-            new_map[new_key] = v
-            replaced_count += 1
-            if dry_run:
-                print(f"  {k!r} -> {new_key!r}")
-        else:
-            new_map[k] = v
-
-    data["weight_map"] = new_map
-
-    if not dry_run:
-        out = Path(out_path) if out_path else index_path
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"Written to {out}")
-
-    return replaced_count
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="将 index JSON 中指定 layer 的 weight_map key 批量替换为新前缀"
-    )
-    parser.add_argument(
-        "index_file",
-        type=Path,
-        help="model.safetensors.index.json 路径",
-    )
-    parser.add_argument(
-        "layer_index",
-        type=int,
-        help="要匹配的层号，如 78 表示 model.layers.78.*",
-    )
-    parser.add_argument(
-        "new_prefix",
-        type=str,
-        help="新 key 的前缀，如 model.layers.0",
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=Path,
-        default=None,
-        help="输出 JSON 路径；不指定则覆盖原文件",
-    )
-    parser.add_argument(
-        "-n", "--dry-run",
-        action="store_true",
-        help="只打印替换结果，不写文件",
-    )
-    args = parser.parse_args()
-
-    n = replace_layer_keys(
-        args.index_file,
-        args.layer_index,
-        args.new_prefix,
-        out_path=args.output,
-        dry_run=args.dry_run,
-    )
-    print(f"Replaced {n} keys for model.layers.{args.layer_index}.* -> {args.new_prefix}.*")
-
-
-if __name__ == "__main__":
-    main()
