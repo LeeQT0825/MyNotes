@@ -1,108 +1,18 @@
-apiversion: modelslim_v1
-metadata:
-  config_id: glm_5_w4a8
-  score: 90
-  verified_model_types:
-    - GLM-5
-  label:
-    w_bit: 4
-    a_bit: 8
-    is_sparse: False
-    kv_cache: False
-
-default_w4a8_dynamic: &default_w4a8_dynamic
-  act:
-    scope: "per_token"
-    dtype: "int8"
-    symmetric: True
-    method: "minmax"
-  weight:
-    scope: "per_channel"
-    dtype: "int4"
-    symmetric: True
-    method: "ssz"
-
-default_w8a8_dynamic: &default_w8a8_dynamic
-  act:
-    scope: "per_token"
-    dtype: "int8"
-    symmetric: True
-    method: "minmax"
-  weight:
-    scope: "per_channel"
-    dtype: "int8"
-    symmetric: True
-    method: "minmax"
-
-spec:
-  process:
-    - type: "quarot"
-    - type: "flex_awq_ssz"
-      qconfig:
-        act:
-          scope: "per_token"
-          dtype: "int8"
-          symmetric: True
-          method: "minmax"
-        weight:
-          scope: "per_channel"
-          dtype: "int4"
-          symmetric: True
-          method: "ssz"
-          ext:
-            step: 10
-      enable_subgraph_type:
-        - 'up-down'
-      include:
-        - "*"
-      exclude:
-        - "model.layers.0.*"
-        - "model.layers.1.*"
-        - "model.layers.2.*"
-        - "*mlp.shared_experts.*"
-    - type: "flex_smooth_quant"
-      enable_subgraph_type:
-        - 'norm-linear'
-        - 'ov'
-        - 'up-down'
-      include:
-        - "*self_attn*"
-        - "model.layers.0.mlp.*"
-        - "model.layers.1.mlp.*"
-        - "model.layers.2.mlp.*"
-        - "*mlp.shared_experts.*"
-        - "*input_layernorm*"
-      exclude:
-        - "*post_attention_layernorm*"
-    - type: "group"
-      configs:
-        - type: "linear_quant"
-          qconfig: *default_w8a8_dynamic
-          include:
-            - "*self_attn*"
-          exclude:
-            - "*kv_b_proj"
-            - "*wk"
-            - "*weights_proj"
-        - type: "linear_quant"
-          qconfig: *default_w8a8_dynamic
-          include:
-            - "*mlp*"
-          exclude:
-            - "*gate"
-            - "*mlp.experts.*"
-        - type: "linear_quant"
-          qconfig: *default_w8a8_dynamic
-          include:
-            - "model.layers.78.mlp.experts.*"
-        - type: "linear_quant"
-          qconfig: *default_w4a8_dynamic
-          include:
-            - "*mlp.experts.*"
-          exclude:
-            - "model.layers.78.*"
-  dataset: qwen3_cot_w4a4.json
-  save:
-    - type: "ascendv1_saver"
-      part_file_size: 4
-
+一 新增说明
+• V1框架丰富量化算法，支持AWQ离群值抑制算法、Rotation Tune算法、GPTQ算法等
+• 支持基于vLLm-Ascend和AisBench的量化精度自动调优
+• 优化一键量化推荐场景
+• 敏感层分析功能支持Attention结构分析
+• 支持模型适配依赖预检
+• 支持mxfp8量化
+二 删除说明
+无
+三 变更说明
+V1框架的权重描述文件中，将model_quant_type的W8A8_DYNAMIC优先级高于W8A8
+四 已知问题
+无
+五 Bugfix
+无
+六 特殊声明
+• accelerate作为msModelSlim多卡依赖库，在特定场景下会导致安装失败报错，在FAQ中登记已知的优化方案
+• 资料文档 https://modelslim.readthedocs.io/zh-cn/latest/
